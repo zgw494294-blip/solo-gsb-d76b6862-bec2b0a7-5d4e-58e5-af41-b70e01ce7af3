@@ -5,12 +5,13 @@
 保证「归档」「停用」「新建炉次」与「修改配方」按某一先后顺序生效；
 读操作拿到的一定是同一版本下自洽的参数与结果。
 
-「修改配方并重算草稿」是唯一分两阶段的操作：锁内只取快照，耗时的求解放在
-锁外（期间 GET 仍能读到上一整次提交的完整状态），随后再上锁、在单条事务里
-复核并发漂移并把配方与全部受影响草稿一起提交；见 update_recipe。连续竞争
-导致复核反复失效时，兜底路径持写互斥锁走完 快照→求解→提交 全程：求解
-仍不持读锁（GET 不被阻塞），其他写操作在写互斥锁上排队，保证本次修改
-必然整体提交成功。
+「修改配方并重算草稿」与「新建炉次」是分两阶段的操作：锁内只取快照，
+耗时的求解放在锁外（期间 GET 仍能读到上一整次提交的完整状态，新草稿
+在整体提交前不可见），随后再上锁、在单条事务里复核并发漂移并整体
+提交；见 update_recipe 与 create_draft。连续竞争导致复核反复失效时，
+兜底路径持写互斥锁走完 快照→求解→提交 全程：求解仍不持读锁（GET
+不被阻塞），其他写操作在写互斥锁上排队，保证本次写操作必然整体提交
+成功。
 """
 
 from __future__ import annotations
@@ -478,6 +479,11 @@ def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict):
 
 # ---------------- 炉次草稿 ----------------
 
+# 新建炉次锁外求解失败后允许的无锁重试次数；期间的并发修改（引用配方被
+# 整份修改）会让整批结果作废重算。超出后转入兜底路径：持写互斥锁走完
+# 快照→求解→提交 全程（求解仍不持读锁），与配方重算的兜底策略一致。
+_CREATE_MAX_ATTEMPTS = 5
+
 
 def list_drafts() -> list[dict]:
     with lock(), connect() as conn:
@@ -497,59 +503,165 @@ def create_draft(name: str, recipe_ids: list[int]) -> dict:
     """按顺序引用 2~3 个不同的可用配方；引用不可改，从 20°C 空记录求解。
 
     引用不存在或已停用的配方 => 422（指明配方 ID），不保存炉次。
+
+    与配方重算相同的两阶段提交流程：
+
+    1. 锁内取引用配方快照（存在 / 可用性在此校验）；
+    2. **锁外**求解——此期间不持锁、未写任何数据，GET /api/recipes、
+       GET /api/drafts、GET /api/drafts/{id} 仍立即读到上一整次提交的
+       完整状态，新草稿在整体提交前绝不可见；
+    3. 锁内、单条 BEGIN IMMEDIATE 事务里复核引用配方（仍存在、仍可用、
+       版本未被他次修改漂移），无漂移才把新草稿一次写入——参数快照、
+       结果/原因与引用版本严格同版。有漂移则整批作废、刷新快照重新求解。
+
+    停用与新建按某一先后顺序生效：停用先提交，则新建在快照或提交复核时
+    看到停用，以 422 失败且不保存。求解异常 / 写库异常时本次新建全部
+    不生效，不会留下新草稿。重试耗尽时转入兜底路径：持写互斥锁（读
+    操作不经过它）走完 快照→求解→提交 全程——求解期间 GET 依旧立即
+    读到上一整次提交的完整状态，其他写操作在写互斥锁上排队，快照到
+    提交之间不会再插入他次写操作，保证本次新建必然整体提交成功。
     """
+    # 阶段 1 + 2：锁内快照、锁外求解，允许在并发修改后整批重算
+    for _ in range(_CREATE_MAX_ATTEMPTS):
+        with lock():
+            snapshot = _snapshot_draft_create(recipe_ids)
+        prepared = _solve_draft_create(snapshot, name, recipe_ids)
+
+        with write_lock(), lock(), connect() as conn:
+            with _tx(conn):
+                draft_id = _commit_draft_create(conn, prepared)
+            if draft_id is not None:
+                return get_draft(draft_id)
+            # 提交期发现引用配方被并发修改：整批作废，刷新快照重新求解
+
+    # 兜底：并发过于激烈时，持写互斥锁走完 快照→求解→提交 全程。求解
+    # 期间不持全局读锁，GET 读到的仍是上一整次提交的完整状态；其他写
+    # 操作在写互斥锁上排队，与本次新建严格按某一先后顺序生效，因此
+    # 快照到提交之间不会再有漂移，复核一次通过、必然提交成功。
+    with write_lock():
+        while True:
+            with lock():
+                snapshot = _snapshot_draft_create(recipe_ids)
+            prepared = _solve_draft_create(snapshot, name, recipe_ids)
+            with lock(), connect() as conn:
+                with _tx(conn):
+                    draft_id = _commit_draft_create(conn, prepared)
+                if draft_id is not None:
+                    return get_draft(draft_id)
+                # 持写互斥锁期间没有其他写操作生效，复核必然通过；
+                # 循环仅为防御，正常只走一遍
+
+
+def _snapshot_draft_create(recipe_ids: list[int]) -> dict:
+    """在已持有全局锁时读取新建炉次所需的引用配方快照（只读，不写数据）。
+
+    引用配方不存在或已停用 => 422（指明配方 ID），与原先锁内校验口径
+    一致；通过则返回按引用顺序排列的配方行（含版本），供锁外求解与
+    提交复核使用。全部读取自同一连接、同一锁时点，状态彼此自洽。
+    """
+    with connect() as conn:
+        placeholders = ",".join("?" * len(recipe_ids))
+        rows = conn.execute(
+            f"SELECT * FROM recipes WHERE id IN ({placeholders})", recipe_ids
+        ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    missing = [rid for rid in recipe_ids if rid not in by_id]
+    if missing:
+        raise Unprocessable(
+            f"配方 ID {', '.join(map(str, missing))} 不存在，无法引用。"
+        )
+    ordered = [by_id[r] for r in recipe_ids]
+    # 停用配方不可用于新建炉次（不保存草稿）；已有引用不受影响
+    disabled = [r["id"] for r in ordered if r["status"] != "active"]
+    if disabled:
+        raise Unprocessable(
+            f"配方 ID {', '.join(map(str, disabled))} 已停用，"
+            "不能用于新建炉次。"
+        )
+    return {"ordered": [dict(r) for r in ordered]}
+
+
+def _solve_draft_create(
+    snapshot: dict, name: str, recipe_ids: list[int]
+) -> dict:
+    """锁外用引用配方快照从 20°C 空记录求解新炉次；只做计算，不碰数据库。
+
+    异常直接向上抛出：此时尚未写入任何数据，本次新建天然全不生效。
+    """
+    ordered = snapshot["ordered"]
+    materials = [_to_material(r) for r in ordered]
+    snapshot_params = [_material_snapshot(r) for r in ordered]
+    versions = {str(r["id"]): r["version"] for r in ordered}
+    # 从 20°C 空记录求解（executed=None），复用原求解规则
+    outcome = solve(materials)
+    if outcome.get("solvable"):
+        solvable, result_json, reason = 1, _dumps(outcome), None
+    else:
+        # 无解：仍保存，但不保留任何曲线，记录中文原因
+        solvable, result_json, reason = 0, None, outcome.get("reason")
+    return {
+        "name": name,
+        "recipe_ids": list(recipe_ids),
+        "ordered": ordered,
+        "materials_json": _dumps(snapshot_params),
+        "recipe_versions_json": _dumps(versions),
+        "solvable": solvable,
+        "result_json": result_json,
+        "reason": reason,
+    }
+
+
+def _commit_draft_create(conn, prepared: dict):
+    """锁内、单条事务内复核引用配方并写入新草稿；返回新草稿 ID。
+
+    复核：引用配方仍存在（配方无删除接口，仅作防御）、仍可用（求解
+    期间被停用 => 422，与「停用先于新建生效」口径一致，不保存草稿）、
+    版本与求解快照一致（否则返回 None，让调用方整批作废、按最新参数
+    重新求解）。复核通过才 INSERT：新草稿的参数快照、结果/原因与引用
+    版本严格同版，且在整体提交前对任何读取不可见。
+    """
+    recipe_ids = prepared["recipe_ids"]
+    snapshot_by_id = {r["id"]: r for r in prepared["ordered"]}
+    placeholders = ",".join("?" * len(recipe_ids))
+    rows = conn.execute(
+        f"SELECT * FROM recipes WHERE id IN ({placeholders})", recipe_ids
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    missing = [rid for rid in recipe_ids if rid not in by_id]
+    if missing:
+        raise Unprocessable(
+            f"配方 ID {', '.join(map(str, missing))} 不存在，无法引用。"
+        )
+    disabled = [rid for rid in recipe_ids if by_id[rid]["status"] != "active"]
+    if disabled:
+        raise Unprocessable(
+            f"配方 ID {', '.join(map(str, disabled))} 已停用，"
+            "不能用于新建炉次。"
+        )
+    for rid in recipe_ids:
+        if by_id[rid]["version"] != snapshot_by_id[rid]["version"]:
+            return None  # 引用配方被他次修改：整批作废，刷新快照重算
+
     now = _now()
-    with write_lock(), lock(), connect() as conn:
-        with _tx(conn):
-            placeholders = ",".join("?" * len(recipe_ids))
-            rows = conn.execute(
-                f"SELECT * FROM recipes WHERE id IN ({placeholders})", recipe_ids
-            ).fetchall()
-            by_id = {r["id"]: r for r in rows}
-            missing = [rid for rid in recipe_ids if rid not in by_id]
-            if missing:
-                raise Unprocessable(
-                    f"配方 ID {', '.join(map(str, missing))} 不存在，无法引用。"
-                )
-            ordered = [by_id[r] for r in recipe_ids]
-            # 停用配方不可用于新建炉次（不保存草稿）；已有引用不受影响
-            disabled = [r["id"] for r in ordered if r["status"] != "active"]
-            if disabled:
-                raise Unprocessable(
-                    f"配方 ID {', '.join(map(str, disabled))} 已停用，"
-                    "不能用于新建炉次。"
-                )
-
-            materials = [_to_material(r) for r in ordered]
-            snapshot = [_material_snapshot(r) for r in ordered]
-            versions = {str(r["id"]): r["version"] for r in ordered}
-            # 从 20°C 空记录求解（executed=None），复用原求解规则
-            outcome = solve(materials)
-            if outcome.get("solvable"):
-                solvable, result_json, reason = 1, _dumps(outcome), None
-            else:
-                solvable, result_json, reason = 0, None, outcome.get("reason")
-
-            cur = conn.execute(
-                """INSERT INTO drafts
-                   (name, recipe_ids, version, recipe_versions_json,
-                    materials_json, solvable, result_json, reason,
-                    created_at, updated_at)
-                   VALUES (?,?,1,?,?,?,?,?,?,?)""",
-                (
-                    name,
-                    _dumps(recipe_ids),
-                    _dumps(versions),
-                    _dumps(snapshot),
-                    solvable,
-                    result_json,
-                    reason,
-                    now,
-                    now,
-                ),
-            )
-            draft_id = cur.lastrowid
-        return get_draft(draft_id)
+    cur = conn.execute(
+        """INSERT INTO drafts
+           (name, recipe_ids, version, recipe_versions_json,
+            materials_json, solvable, result_json, reason,
+            created_at, updated_at)
+           VALUES (?,?,1,?,?,?,?,?,?,?)""",
+        (
+            prepared["name"],
+            _dumps(recipe_ids),
+            prepared["recipe_versions_json"],
+            prepared["materials_json"],
+            prepared["solvable"],
+            prepared["result_json"],
+            prepared["reason"],
+            now,
+            now,
+        ),
+    )
+    return cur.lastrowid
 
 
 def archive_draft(draft_id: int, expected_version: int) -> dict:
